@@ -1,0 +1,24 @@
+# Cloaking prototype — pinned CPU dependencies (Python 3.12, Linux x86_64)
+# Single-command install should work thanks to the extra index below:
+#   pip install -r requirements.txt
+# If pip ever tries to pull the ~800MB CUDA torch wheel instead of the CPU
+# one, install torch/torchvision first from the CPU index, then the rest with
+# --no-deps:
+#   pip install torch==2.14.1+cpu torchvision==0.29.1+cpu \
+#       --index-url https://download.pytorch.org/whl/cpu
+#   pip install --no-deps -r requirements.txt   # (torch lines already satisfied)
+# (facenet-pytorch needs requests/urllib3/certifi/charset-normalizer/idna/tqdm;
+#  all listed below with pins.)
+--index-url https://pypi.org/simple/
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+facenet-pytorch==2.6.0
+pillow==12.3.0
+numpy==2.5.2
+requests==2.34.2
+urllib3==2.8.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+tqdm==4.70.1

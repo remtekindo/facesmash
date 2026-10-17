@@ -1,0 +1,25 @@
+# Service requirements = prototype's validated CPU pins + web stack.
+# Install order matters: torch CPU FIRST (plain facenet-pytorch would pull the
+# ~755MB CUDA torch wheel). See Dockerfile for the staged install.
+--index-url https://pypi.org/simple/
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+# NOTE: facenet-pytorch is installed separately in the Dockerfile with --no-deps
+# AFTER this file, because its metadata (numpy<2.0) conflicts with the
+# prototype-validated numpy 2.5.2 pin during pip's dependency resolution.
+# (Runtime combo torch 2.14.1+cpu + numpy 2.5.2 + facenet-pytorch 2.6.0 is validated.)
+pillow==12.3.0
+numpy==2.5.2
+requests==2.34.2
+urllib3==2.8.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+tqdm==4.70.1
+# --- web stack (not part of the validated prototype pins; resolved at build time) ---
+fastapi
+uvicorn
+python-multipart
+# --- persistence (rules-mandated Firebase/Firestore usage; see FIRESTORE_SETUP.md) ---
+google-cloud-firestore
