@@ -175,7 +175,14 @@ async def protect(
         face_native = pil_to_tensor(img.crop(box))  # original, full res
         cloaked_native = (face_native + delta_up).clamp(0, 1)
     out = img.copy()
-    out.paste(tensor_to_pil(cloaked_native), box)
+    # Feathered paste (2026-10-18): a hard-edged box boundary is perceptible
+    # even when the perturbation itself is invisible. Blur the paste mask so
+    # the cloaked region blends seamlessly into the unperturbed background.
+    from PIL import ImageFilter
+    feather_radius = max(8, min(box_w, box_h) // 25)
+    mask = Image.new("L", (box_w, box_h), 255).filter(
+        ImageFilter.GaussianBlur(radius=feather_radius))
+    out.paste(tensor_to_pil(cloaked_native), box, mask)
 
     with torch.no_grad():
         e0 = embed_fn(face_tensor)
