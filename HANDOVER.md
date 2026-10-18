@@ -55,6 +55,13 @@ NOT verified:
 - Firestore writes with the new `metrics`/`verification` payload (schema is a superset of v1).
 - Any commercial recogniser.
 
+## Update — Cloud Build failure reported (cause NOT confirmed)
+The user's Cloud Build run of v2 failed; no log was available to me and no Docker daemon exists in my sandbox, so
+the cause is unconfirmed. Suspects, in order: (1) the Dockerfile heredoc (`RUN python - <<'PY'`) needs BuildKit —
+now replaced by `service/fetch_models.py`; (2) Cloud Build's default 10-minute timeout (use `--timeout=1800`);
+(3) pip resolution of `onnx`/`onnx2torch`. `fetch_models.py` was run here and downloads both ONNX files correctly.
+To diagnose: send the failing step's last ~30 log lines. The live v1 service is untouched (branch `main` unchanged).
+
 ## Next steps (suggested order)
 1. Deploy engine with `--concurrency=1 --cpu=2 --memory=4Gi --timeout=300`; run `/health` and `/report/selftest`.
 2. Decide the default strength: `standard` = 6/8 faces fully broken; `max` = 8/8 with slightly more visible change.

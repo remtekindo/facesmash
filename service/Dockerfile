@@ -1,4 +1,5 @@
-# Build context MUST be ~/workspace/ai-builders-cup/ (so prototype/cloak.py is included):
+# Build context MUST be the repo root (so prototype/cloak_v2.py is included). Cloud Build: pass --timeout=1800
+# (default 10 min can be too short for torch + 2 model downloads):
 #   docker build -f service/Dockerfile -t face-cloak .
 FROM python:3.12-slim
 
@@ -21,15 +22,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # 2. ArcFace-family ONNX weights (insightface model zoo, GitHub release v0.7).
 #    mbf  = MobileFaceNet, optimised against (cheap);  r50 = ResNet50, HOLD-OUT (verification only).
 #    NOTE: insightface pretrained models are research / non-commercial licensed.
-RUN mkdir -p /app/models && python - <<'PY'
-import io, urllib.request, zipfile
-base = "https://github.com/deepinsight/insightface/releases/download/v0.7/"
-for zip_name, member in (("buffalo_s.zip", "w600k_mbf.onnx"), ("buffalo_l.zip", "w600k_r50.onnx")):
-    data = urllib.request.urlopen(base + zip_name, timeout=600).read()
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        open("/app/models/" + member, "wb").write(z.read(member))
-    print("fetched", member)
-PY
+COPY service/fetch_models.py ./fetch_models.py
+RUN python fetch_models.py /app/models
 ENV FACESMASH_MBF_ONNX=/app/models/w600k_mbf.onnx \
     FACESMASH_ARCFACE_ONNX=/app/models/w600k_r50.onnx
 
