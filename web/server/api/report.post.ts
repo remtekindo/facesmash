@@ -8,7 +8,8 @@ export default defineEventHandler(async (event) => {
       method: 'POST',
       body: {
         metrics: body.metrics,
-        meta: { strength: body.meta?.strength || 'standard', processing_time_ms: body.meta?.processing_time_ms || 0 },
+        meta: { strength: body.meta?.strength || 'standard', processing_time_ms: body.meta?.processing_time_ms || 0, faces_protected: body.meta?.faces_protected || 1 },
+        verification: body.verification || {},
         lang: body.lang || 'en',
       },
       timeout: 60000,

@@ -1,18 +1,22 @@
 """
-Face Cloak microservice — thin FastAPI wrapper around prototype/cloak.py.
+Face Cloak microservice — FastAPI wrapper around prototype/cloak_v2.py.
 
-Implements the team API contract v0.1 (see ../api-contract.md), which the
-Flutter app and Laravel gateway are already building against with mocks.
+v0.2 (2026-10-18): engine v2 (ensemble + DSSIM perceptual budget + EOT) and
+metrics measured on the FINAL output image (re-detected, re-cropped, re-embedded
+under PNG / JPEG-75 / downscale+JPEG-75) — not on the 160x160 crop that was
+optimised, which is what v0.1 reported.
 
-The heavy ML (LowKey-style PGD cloaking vs InceptionResnetV1) is reused
-as-is from prototype/cloak.py; this file only handles HTTP, validation,
-metrics, and response shaping.
+Endpoints: POST /protect, POST /report (Gemini), GET /report/selftest, GET /health.
 """
 import base64
 import io
+import json
+import logging
+import math
 import os
 import random
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -30,48 +34,43 @@ from pydantic import BaseModel, Field
 # never break /protect (see firestore_store.py).
 from firestore_store import save_protection_job
 
-# Reuse the validated prototype code without copying or modifying it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
-from cloak import (  # noqa: E402
-    cloak_face,
-    detect_face_box,
-    jpeg_roundtrip,
-    load_models,
-    make_embed_fn,
-    pil_to_tensor,
-    tensor_to_pil,
-)
+import cloak_v2 as C  # noqa: E402
 
-VERSION = "0.1"
+log = logging.getLogger("face-cloak")
+
+VERSION = "0.2"
+ENGINE_NAME = f"cloak-v2 {VERSION} (ensemble PGD + DSSIM budget + EOT)"
 MAX_BYTES = 10 * 1024 * 1024          # 10 MB
 MAX_DIM = 2048                        # downscale if larger
+MAX_FACES = int(os.environ.get("MAX_FACES", "2"))
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
-STRENGTH_STEPS = {"low": 30, "standard": 60, "max": 90}
-# Embedding L2 distance above which identity matching breaks (per prototype/RESULTS.md)
-MATCH_BREAK_THRESHOLD = 1.0
+# cos(original, protected) at/below which a recogniser no longer matches the identity.
+MATCH_COS = C.MATCH_COS_THRESHOLD
+PARTIAL_COS = 0.50
 
 _models: dict = {}
+_gpu_lock = threading.Lock()   # one heavy job at a time (CPU + RAM bound)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load once at startup (~2.3 s on CPU), not per request.
-    mtcnn, resnet = load_models("cpu")
-    _models["mtcnn"] = mtcnn
-    _models["embed_fn"] = make_embed_fn(resnet, "cpu")
+    # Load once at startup, not per request.
+    torch.set_num_threads(int(os.environ.get("TORCH_THREADS", os.cpu_count() or 2)))
+    from facenet_pytorch import MTCNN
+    _models["mtcnn"] = MTCNN(image_size=160, margin=0, keep_all=True, device="cpu")
+    # vggface2 + casia + mbf are optimised against; arcface (R50) is HOLD-OUT:
+    # only used to verify transfer, never attacked. Missing ONNX files are skipped.
+    _models["ens"] = C.Ensemble(("vggface2", "casia", "mbf", "arcface"), holdout=("arcface",))
+    log.info("ensemble: %s (holdout: %s)", _models["ens"].names, sorted(_models["ens"].holdout))
     yield
     _models.clear()
 
 
 app = FastAPI(title="Face Cloak Service", version=VERSION, lifespan=lifespan)
 
-# CORS: per api-contract.md v0.2 the Nuxt web app POSTs /report directly to
-# this service from the browser. A cross-origin JSON POST triggers a CORS
-# preflight (OPTIONS); without this middleware FastAPI answers 405 and the
-# browser blocks the call. Server-to-server calls (Nuxt server route ->
-# /protect) are unaffected by this. Restrict via CORS_ALLOW_ORIGINS
-# (comma-separated) once the web app's URL is known; default "*" is fine
-# for the competition demo since the service is --allow-unauthenticated.
+# CORS: the Nuxt web app normally calls this service server-to-server; restrict via
+# CORS_ALLOW_ORIGINS (comma-separated) if browsers call it directly.
 _cors_origins = [
     o.strip()
     for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",")
@@ -92,7 +91,7 @@ def root():
         "version": VERSION,
         "health": "/health",
         "docs": "/docs",
-        "endpoints": ["POST /protect", "POST /report"],
+        "endpoints": ["POST /protect", "POST /report", "GET /report/selftest"],
     }
 
 
@@ -104,42 +103,69 @@ async def _http_exc_handler(request, exc: HTTPException):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_loaded": "mtcnn" in _models, "version": VERSION}
+    ens = _models.get("ens")
+    return {
+        "status": "ok",
+        "models_loaded": "mtcnn" in _models,
+        "version": VERSION,
+        "ensemble": ens.names if ens else [],
+        "holdout": sorted(ens.holdout & set(ens.names)) if ens else [],
+        "gemini": _gemini_status(),
+    }
 
 
-def _psnr_db(a: Image.Image, b: Image.Image) -> float:
-    arr_a = np.asarray(a).astype(np.float64)
-    arr_b = np.asarray(b).astype(np.float64)
-    mse = float(np.mean((arr_a - arr_b) ** 2))
-    if mse == 0:
-        return float("inf")
-    return float(10 * np.log10(255.0**2 / mse))
+# --------------------------------------------------------------------------- #
+# Visual-quality metrics on the REAL output (face regions only)
+# --------------------------------------------------------------------------- #
+def _visual(orig: Image.Image, out: Image.Image, jobs) -> dict:
+    a, b = C.pil_to_t(orig), C.pil_to_t(out)
+    psnrs, ssims = [], []
+    for j in jobs:
+        x1, y1, x2, y2 = [int(v) for v in j.box]
+        x1, y1 = max(0, x1), max(0, y1)
+        fa, fb = a[:, y1:y2, x1:x2], b[:, y1:y2, x1:x2]
+        if fa.shape[-1] < 8 or fa.shape[-2] < 8:
+            continue
+        mse = float(((fa - fb) ** 2).mean())
+        psnrs.append(99.0 if mse == 0 else 10 * math.log10(1.0 / mse))
+        ssims.append(float(C._ssim_map(fa, fb).mean()))
+    mse_full = float(((a - b) ** 2).mean())
+    return {
+        "psnr_face": float(np.mean(psnrs)) if psnrs else 99.0,
+        "ssim_face": float(np.mean(ssims)) if ssims else 1.0,
+        "psnr_full": 99.0 if mse_full == 0 else 10 * math.log10(1.0 / mse_full),
+    }
 
 
-@app.post("/protect")
-async def protect(
-    image: UploadFile = File(...),
-    strength: str = Form("standard"),
-    seed: int | None = Form(None),
-    jpeg_simulate: bool = Form(True),
-):
+def _visibility_label(ssim: float) -> str:
+    if ssim >= 0.975:
+        return "near-invisible"
+    if ssim >= 0.95:
+        return "subtle"
+    if ssim >= 0.92:
+        return "visible on close look"
+    return "visible"
+
+
+def _l2_from_cos(c: float) -> float:
+    return math.sqrt(max(0.0, 2.0 - 2.0 * c))
+
+
+def _protect_sync(raw: bytes, content_type: str, strength: str, seed, max_faces: int) -> dict:
     t_start = time.time()
-
-    if strength not in STRENGTH_STEPS:
+    if strength not in C.STRENGTH:
         raise HTTPException(400, {"error": "BAD_STRENGTH",
-                                  "message": f"strength must be one of {sorted(STRENGTH_STEPS)}"})
-
-    raw = await image.read()
+                                  "message": f"strength must be one of {sorted(C.STRENGTH)}"})
     if len(raw) > MAX_BYTES:
         raise HTTPException(413, {"error": "TOO_LARGE",
                                   "message": f"image exceeds {MAX_BYTES // 1024 // 1024} MB; downscale client-side first"})
-    if (image.content_type or "") not in ALLOWED_TYPES:
+    if (content_type or "") not in ALLOWED_TYPES:
         raise HTTPException(400, {"error": "BAD_IMAGE",
-                                  "message": f"unsupported content type: {image.content_type}"})
+                                  "message": f"unsupported content type: {content_type}"})
     try:
         img = Image.open(io.BytesIO(raw))
         img.load()  # force full decode to catch truncated files
-        img = img.convert("RGB")
+        img = img.convert("RGB")   # also drops EXIF/GPS metadata: the output carries none
     except Exception:
         raise HTTPException(400, {"error": "BAD_IMAGE", "message": "unreadable image file"})
 
@@ -148,247 +174,309 @@ async def protect(
         img.thumbnail((MAX_DIM, MAX_DIM), Image.LANCZOS)
         downscaled = True
 
-    mtcnn, embed_fn = _models["mtcnn"], _models["embed_fn"]
-    box, prob_before = detect_face_box(mtcnn, img)
-    if box is None:
+    mtcnn, ens = _models["mtcnn"], _models["ens"]
+    all_jobs = C.detect_faces(mtcnn, img, max_faces=max(1, min(max_faces, MAX_FACES)), min_prob=0.9)
+    if not all_jobs:
+        # fall back to the single best face at a lower confidence bar
+        all_jobs = C.detect_faces(mtcnn, img, max_faces=1, min_prob=0.0)
+    if not all_jobs:
         raise HTTPException(422, {"error": "NO_FACE",
                                   "message": "no face detected; use a clearer front-facing photo"})
-
+    jobs = all_jobs
+    prob_before = max(j.prob for j in jobs)
     run_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
 
-    crop = img.crop(box).resize((160, 160), Image.BILINEAR)
-    face_tensor = pil_to_tensor(crop)
-    cloaked_crop, _dists, _pgd_s = cloak_face(
-        face_tensor, embed_fn, steps=STRENGTH_STEPS[strength], seed=run_seed, verbose=False)
+    with _gpu_lock:
+        refs = C.reference_embeddings(img, mtcnn, ens, jobs)
+        out, _results = C.cloak_image(img, jobs, ens, C.cfg_for(strength, seed=run_seed))
+        ver = C.verify(img, out, mtcnn, ens, jobs, refs)
 
-    # Delta-upscale fix (2026-10-18): the old code pasted the 160x160 cloaked
-    # crop resized back up, destroying original detail via the downscale-upscale
-    # cycle (this was the main source of visible degradation, not just PGD).
-    # Now: upscale ONLY the perturbation delta and add it to the ORIGINAL
-    # high-res face, preserving all native detail.
-    box_w, box_h = box[2] - box[0], box[3] - box[1]
-    with torch.no_grad():
-        delta_160 = cloaked_crop - face_tensor  # in [-eps, eps]
-        delta_up = torch.nn.functional.interpolate(
-            delta_160.unsqueeze(0), size=(box_h, box_w),
-            mode="bilinear", align_corners=False).squeeze(0)
-        face_native = pil_to_tensor(img.crop(box))  # original, full res
-        cloaked_native = (face_native + delta_up).clamp(0, 1)
-    out = img.copy()
-    # Feathered paste (2026-10-18): a hard-edged box boundary is perceptible
-    # even when the perturbation itself is invisible. Blur the paste mask so
-    # the cloaked region blends seamlessly into the unperturbed background.
-    from PIL import ImageFilter
-    feather_radius = max(8, min(box_w, box_h) // 25)
-    mask = Image.new("L", (box_w, box_h), 255).filter(
-        ImageFilter.GaussianBlur(radius=feather_radius))
-    out.paste(tensor_to_pil(cloaked_native), box, mask)
+    boxes, probs = mtcnn.detect(out)
+    prob_after = float(np.max(probs)) if boxes is not None and len(boxes) else 0.0
+    vis = _visual(img, out, jobs)
 
-    with torch.no_grad():
-        e0 = embed_fn(face_tensor)
-        e1 = embed_fn(cloaked_crop)
-        emb_dist = float(torch.norm(e1 - e0, p=2))
-        cos_sim = float(torch.nn.functional.cosine_similarity(e0, e1, dim=0))
-
-    jpeg_q75_distance = None
-    jpeg_q75_survived = None
-    if jpeg_simulate:
-        # Simulated social-media upload: does protection survive JPEG Q75?
-        q75 = jpeg_roundtrip(cloaked_crop, quality=75)
-        with torch.no_grad():
-            e2 = embed_fn(q75)
-            jpeg_q75_distance = float(torch.norm(e2 - e0, p=2))
-        jpeg_q75_survived = bool(jpeg_q75_distance >= MATCH_BREAK_THRESHOLD)
-
-    _box2, prob_after = detect_face_box(mtcnn, out)
-    psnr = _psnr_db(img, out)
+    worst_all = ver["worst_cos_all"]
+    # "survives upload compression": worst case over the two lossy transforms only
+    lossy = [max((v for v in pf.values() if v is not None), default=1.0)
+             for t in ("jpeg75", "down50_jpeg75") for pf in ver["per_transform"][t]]
+    worst_lossy = max(lossy) if lossy else 1.0
+    verdict = "broken" if worst_all <= MATCH_COS else "partial" if worst_all <= PARTIAL_COS else "weak"
 
     buf = io.BytesIO()
     out.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     elapsed_ms = int((time.time() - t_start) * 1000)
 
-    # Firestore job history: one doc per completed /protect — params,
-    # metrics and verdict only, never the photo. Returns None (and logs a
-    # warning) if persistence is disabled or the write fails.
-    firestore_job_id = save_protection_job({
+    metrics = {
+        "detection_before": round(prob_before, 4),
+        "detection_after": round(prob_after, 4),
+        # worst case over every checked model AND every upload transform, on the final photo
+        "embedding_distance": round(_l2_from_cos(worst_all), 4),
+        "cosine_similarity": round(worst_all, 4),
+        "jpeg_q75_survived": bool(worst_lossy <= MATCH_COS),
+        "jpeg_q75_distance": round(_l2_from_cos(worst_lossy), 4),
+        "psnr_db": round(vis["psnr_face"], 1),          # face region (was: whole image)
+        "psnr_full_db": round(vis["psnr_full"], 1),
+        "ssim_face": round(vis["ssim_face"], 4),
+        "visibility": _visibility_label(vis["ssim_face"]),
+    }
+    verification = {
+        "verdict": verdict,                                  # broken | partial | weak
+        "identity_match_broken": bool(worst_all <= MATCH_COS),
+        "match_threshold_cos": MATCH_COS,
+        "models": {n: {"worst_cos": round(c, 4),
+                       "role": "independent check (not optimised against)" if n in ens.holdout else "optimised against"}
+                   for n, c in ver["worst_cos"].items()},
+        "transforms": list(ver["per_transform"].keys()),
+    }
+    meta = {
+        "engine": ENGINE_NAME,
+        "surrogate_model": " + ".join(n for n in ens.names if n not in ens.holdout),
+        "independent_check": sorted(ens.holdout & set(ens.names)),
         "strength": strength,
         "seed": run_seed,
-        "downscaled": downscaled,
         "processing_time_ms": elapsed_ms,
-        "engine": f"cloak-py {VERSION} (LowKey-style PGD)",
-        "surrogate_model": "InceptionResnetV1 / VGGFace2",
-        "match_break_threshold": MATCH_BREAK_THRESHOLD,
-        "metrics": {
-            "detection_before": round(prob_before, 4),
-            "detection_after": round(prob_after, 4),
-            "embedding_distance": round(emb_dist, 4),
-            "cosine_similarity": round(cos_sim, 4),
-            "jpeg_q75_survived": jpeg_q75_survived,
-            "jpeg_q75_distance": round(jpeg_q75_distance, 4) if jpeg_q75_distance is not None else None,
-            "psnr_db": round(psnr, 1),
-        },
-        "verdict": {
-            "identity_match_broken": bool(emb_dist >= MATCH_BREAK_THRESHOLD),
-            "jpeg_q75_survived": jpeg_q75_survived,
-        },
+        "downscaled": downscaled,
+        "faces_protected": len(jobs),
+    }
+
+    # Firestore job history: params, metrics and verdict only — never the photo.
+    firestore_job_id = save_protection_job({
+        "strength": strength, "seed": run_seed, "downscaled": downscaled,
+        "processing_time_ms": elapsed_ms, "engine": ENGINE_NAME,
+        "faces_protected": len(jobs), "metrics": metrics, "verification": verification,
         "version": VERSION,
     })
-
-    meta = {
-        "engine": f"cloak-py {VERSION} (LowKey-style PGD)",
-        "surrogate_model": "InceptionResnetV1 / VGGFace2",
-        "strength": strength,
-        "seed": run_seed,
-        "processing_time_ms": elapsed_ms,
-        "downscaled": downscaled,
-    }
     if firestore_job_id:
         meta["firestore_job_id"] = firestore_job_id
 
-    return {
-        "protected_image": b64,
-        "metrics": {
-            "detection_before": round(prob_before, 4),
-            "detection_after": round(prob_after, 4),
-            "embedding_distance": round(emb_dist, 4),
-            "cosine_similarity": round(cos_sim, 4),
-            "jpeg_q75_survived": jpeg_q75_survived,
-            "jpeg_q75_distance": round(jpeg_q75_distance, 4) if jpeg_q75_distance is not None else None,
-            "psnr_db": round(psnr, 1),
-        },
-        "meta": meta,
-    }
+    return {"protected_image": b64, "metrics": metrics, "verification": verification, "meta": meta}
 
 
-# ---------------------------------------------------------------------------
-# POST /report — Gemini plain-language evaluation report (contract v0.2,
-# implemented 2026-10-13). Moved server-side into this service so the Nuxt app
-# just POSTs here; no separate Nuxt server route / Gemini integration needed.
-# The API key never leaves the server (env var). Without a key the endpoint
-# serves the contract's mock response, so the UI contract is identical.
-# ---------------------------------------------------------------------------
+@app.post("/protect")
+def protect(
+    image: UploadFile = File(...),
+    strength: str = Form("standard"),
+    seed: int | None = Form(None),
+    jpeg_simulate: bool = Form(True),     # kept for contract compatibility; verification always runs
+    max_faces: int = Form(MAX_FACES),
+):
+    # sync endpoint -> FastAPI runs it in a worker thread, /health stays responsive
+    return _protect_sync(image.file.read(), image.content_type, strength, seed, max_faces)
 
+
+# --------------------------------------------------------------------------- #
+# POST /report — Gemini plain-language report.
+# Backends: (1) Gemini Developer API key, (2) Vertex AI via the Cloud Run service
+# account (ADC). The response says exactly what happened: source = "gemini" or
+# "template" (deterministic, metrics-based, clearly labelled) — never a silent mock.
+# --------------------------------------------------------------------------- #
 class ReportMetrics(BaseModel):
     detection_before: float = 1.0
-    detection_after: float = 0.9997
+    detection_after: float = 1.0
     embedding_distance: float = Field(..., ge=0)
     cosine_similarity: float = 0.0
-    jpeg_q75_survived: bool = True
-    psnr_db: float = 32.7
+    jpeg_q75_survived: bool = False
+    psnr_db: float = 0.0
+    ssim_face: float | None = None
+    visibility: str | None = None
 
 
 class ReportMeta(BaseModel):
     strength: str = "standard"
     processing_time_ms: int = 0
+    faces_protected: int = 1
+
+
+class ReportVerification(BaseModel):
+    verdict: str | None = None
+    models: dict = {}
 
 
 class ReportRequest(BaseModel):
     metrics: ReportMetrics
     meta: ReportMeta = ReportMeta()
+    verification: ReportVerification = ReportVerification()
     lang: str = "id"  # "id" (default) or "en"
 
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+VERTEX_URL = ("https://{host}/v1/projects/{project}/locations/{loc}/publishers/google/models/{model}:generateContent")
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-flash-latest"] if m]
 
-# Honest-limits guardrails (must survive into every generated report):
-# the cloak breaks *identity matching*, not face detection; it was validated
-# against ONE surrogate model (InceptionResnetV1/VGGFace2), one test face, and
-# a simulated social-media pipeline — never claim it defeats Meta/Google/Apple
-# models or guarantees absolute protection.
-_REPORT_SYSTEM_ID = (
-    "Kamu adalah asisten privasi dalam aplikasi pelindung foto. Jelaskan hasil proteksi "
-    "di bawah ini dengan bahasa Indonesia yang sederhana dan menenangkan, untuk pengguna awam. "
-    "Struktur: (1) satu kalimat kesimpulan — apakah foto ini sekarang aman dari pengenalan wajah AI; "
-    "(2) jelaskan tiap angka dalam 1 kalimat bahasa sehari-hari; "
-    "(3) satu paragraf jujur tentang batasan — proteksi ini mematahkan pencocokan identitas "
-    "(bukan deteksi wajah) dan teruji pada satu model tertentu dalam simulasi, bukan jaminan mutlak "
-    "terhadap semua AI dan bukan klaim bisa mengalahkan model perusahaan besar; "
-    "(4) satu tips praktis. Maksimal 150 kata. Jangan melebih-lebihkan klaim."
-)
-_REPORT_SYSTEM_EN = (
-    "You are a privacy assistant inside a photo-protection app. Explain the protection results "
-    "below in simple, reassuring plain English for a non-technical user. "
-    "Structure: (1) one concluding sentence — whether this photo is now safe from AI face recognition; "
-    "(2) one everyday-language sentence per number; "
-    "(3) one honest paragraph on limits — this breaks identity matching (not face detection) and was "
-    "validated against a single surrogate model in simulation, not a guarantee against all AI and not "
-    "a claim to defeat big-tech models; "
-    "(4) one practical tip. Max 150 words. Never overstate claims."
-)
+_SYSTEM = {
+    "en": (
+        "You are the privacy assistant inside a photo-protection app (Face Smash). Explain the VERIFIED "
+        "results you are given to a non-technical user, in plain English. Rules: (1) never contradict the "
+        "given verdict (broken = identity match broken on every checked model; partial = some models may "
+        "still match; weak = likely still recognisable) and never invent numbers; (2) the checks were run on "
+        "a few open-source face-recognition models in simulation — say plainly this is not a guarantee against "
+        "commercial systems or future AI, and never claim it defeats any named company; (3) the protection "
+        "stops identity matching, not face detection; (4) if visibility is not 'near-invisible', say the photo "
+        "may look slightly retouched. Keep summary under 90 words, 3 short bullets for the numbers, "
+        "one honest-limits sentence, and 2 practical tips."),
+    "id": (
+        "Kamu asisten privasi di aplikasi pelindung foto (Face Smash). Jelaskan hasil TERVERIFIKASI di bawah "
+        "kepada pengguna awam dalam bahasa Indonesia sederhana. Aturan: (1) jangan bertentangan dengan verdict "
+        "(broken = pencocokan identitas patah di semua model yang diuji; partial = sebagian model mungkin masih "
+        "mengenali; weak = kemungkinan masih dikenali) dan jangan mengarang angka; (2) pengujian dilakukan pada "
+        "beberapa model open-source dalam simulasi — katakan jelas ini bukan jaminan terhadap sistem komersial "
+        "atau AI masa depan, dan jangan klaim mengalahkan perusahaan tertentu; (3) proteksi menghentikan "
+        "pencocokan identitas, bukan deteksi wajah; (4) jika visibility bukan 'near-invisible', sebutkan foto "
+        "mungkin tampak sedikit diretus. Ringkasan di bawah 90 kata, 3 poin singkat untuk angka, satu kalimat "
+        "batasan jujur, dan 2 tips praktis."),
+}
 
-_REPORT_MOCK_ID = (
-    "Foto kamu sekarang jauh lebih aman. Sistem pengenal wajah AI tidak lagi bisa mengaitkan foto ini "
-    "dengan identitasmu (skor kemiripan turun jauh di bawah batas). Proteksinya tetap bertahan walau foto "
-    "dikompres saat diupload ke media sosial, dan secara kasat mata fotomu tidak berubah. Batasan jujur: "
-    "pengujian dilakukan terhadap model tertentu — ini perlindungan kuat, bukan jaminan mutlak terhadap "
-    "semua AI di masa depan. Tips: gunakan kekuatan 'max' untuk foto yang sangat sensitif."
-)
-_REPORT_MOCK_EN = (
-    "Your photo is now much safer. AI face-recognition systems can no longer link this photo to your "
-    "identity (the similarity score dropped far below the threshold). The protection survives compression "
-    "when uploaded to social media, and your photo looks unchanged to the naked eye. Honest limits: "
-    "testing was done against a specific model — this is strong protection, not an absolute guarantee "
-    "against all future AI. Tip: use 'max' strength for highly sensitive photos."
-)
+_REPORT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "headline": {"type": "STRING"},
+        "summary": {"type": "STRING"},
+        "numbers": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "limits": {"type": "STRING"},
+        "tips": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["headline", "summary", "numbers", "limits", "tips"],
+}
 
 
-def _report_user_prompt(m: ReportMetrics, meta: ReportMeta, lang: str) -> str:
-    if lang == "en":
-        return (
-            f"Photo protection results: embedding distance {m.embedding_distance} (identity threshold ~1.0 — "
-            f"farther means less recognizable), cosine similarity {m.cosine_similarity}, face detection before "
-            f"{m.detection_before} / after {m.detection_after}, survives social-media compression: "
-            f"{m.jpeg_q75_survived}, visual quality {m.psnr_db} dB (above 30 = nearly invisible). "
-            f"Strength: {meta.strength}."
-        )
-    return (
-        f"Hasil proteksi foto: jarak embedding {m.embedding_distance} (batas identitas ~1.0 — semakin jauh "
-        f"semakin tidak dikenali), kemiripan kosinus {m.cosine_similarity}, deteksi wajah sebelum "
-        f"{m.detection_before} / sesudah {m.detection_after}, tahan kompresi media sosial: "
-        f"{m.jpeg_q75_survived}, kualitas visual {m.psnr_db} dB (di atas 30 = nyaris tak terlihat). "
-        f"Kekuatan: {meta.strength}."
-    )
+def _facts(body: ReportRequest) -> dict:
+    m = body.metrics
+    verdict = body.verification.verdict or (
+        "broken" if m.cosine_similarity <= MATCH_COS else "partial" if m.cosine_similarity <= PARTIAL_COS else "weak")
+    return {
+        "verdict": verdict,
+        "worst_case_cosine_similarity_on_final_photo": m.cosine_similarity,
+        "match_threshold_cosine": MATCH_COS,
+        "embedding_distance_l2": m.embedding_distance,
+        "survives_jpeg_and_resize": m.jpeg_q75_survived,
+        "face_detection_before_after": [m.detection_before, m.detection_after],
+        "visual_quality_psnr_face_db": m.psnr_db,
+        "ssim_face": m.ssim_face,
+        "visibility": m.visibility,
+        "strength": body.meta.strength,
+        "faces_protected": body.meta.faces_protected,
+        "per_model_worst_cosine": {k: v.get("worst_cos") for k, v in body.verification.models.items()},
+    }
 
 
-def _gemini_report(system: str, user_prompt: str) -> tuple[str, str] | None:
-    """Call Gemini generateContent REST API. Returns (report text, model), or None on any failure."""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GEMINI_API_KEY")
-    if not api_key:
-        return None
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    try:
-        r = requests.post(
-            GEMINI_API_URL.format(model=model),
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json={
-                "system_instruction": {"parts": [{"text": system}]},
-                "contents": [{"parts": [{"text": user_prompt}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 400},
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return (text, model)
-    except Exception:
-        return None
+def _gemini_status() -> dict:
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GEMINI_API_KEY"):
+        return {"configured": True, "backend": "api_key", "models": GEMINI_MODELS}
+    if os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or os.environ.get("K_SERVICE"):
+        return {"configured": True, "backend": "vertex_adc", "models": GEMINI_MODELS}
+    return {"configured": False, "backend": None, "models": GEMINI_MODELS}
+
+
+def _vertex_token_and_project():
+    import google.auth
+    import google.auth.transport.requests
+    creds, project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    creds.refresh(google.auth.transport.requests.Request())
+    return creds.token, (os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or project)
+
+
+def _gemini_generate(system: str, user_text: str, schema: dict | None = None) -> tuple[str, str, str]:
+    """Returns (text, model, backend). Raises RuntimeError(code) if every attempt fails."""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GEMINI_API_KEY")
+    gen_cfg = {"temperature": 0.4, "maxOutputTokens": 900}
+    if schema:
+        gen_cfg.update({"responseMimeType": "application/json", "responseSchema": schema})
+    payload = {"systemInstruction": {"parts": [{"text": system}]},
+               "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+               "generationConfig": gen_cfg}
+    if not _gemini_status()["configured"]:
+        raise RuntimeError("no_credentials")      # no API key and not running on GCP
+    last = "no_credentials"
+    for model in GEMINI_MODELS:
+        try:
+            if key:
+                backend = "api_key"
+                r = requests.post(GEMINI_API_URL.format(model=model), json=payload, timeout=30,
+                                  headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+            else:
+                backend = "vertex_adc"
+                token, project = _vertex_token_and_project()
+                loc = os.environ.get("VERTEX_LOCATION", "us-central1")
+                host = "aiplatform.googleapis.com" if loc == "global" else f"{loc}-aiplatform.googleapis.com"
+                r = requests.post(VERTEX_URL.format(host=host, project=project, loc=loc, model=model),
+                                  json=payload, timeout=30,
+                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            if r.status_code != 200:
+                last = f"http_{r.status_code}"
+                log.warning("gemini %s via %s -> HTTP %s: %s", model, backend, r.status_code, r.text[:200])
+                continue
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if text:
+                return text, model, backend
+            last = "empty_response"
+        except Exception as exc:  # noqa: BLE001 — credentials, timeout, parse...
+            last = type(exc).__name__
+            log.warning("gemini %s failed: %s", model, exc)
+    raise RuntimeError(last)
+
+
+def _template_report(body: ReportRequest, lang: str) -> dict:
+    """Deterministic, metrics-based fallback. Honest about weak results; no gen-AI claim."""
+    f = _facts(body)
+    v, cos, vis = f["verdict"], f["worst_case_cosine_similarity_on_final_photo"], f["visibility"] or "n/a"
+    if lang == "id":
+        head = {"broken": "Pencocokan identitas terpatahkan pada model yang diuji.",
+                "partial": "Proteksi sebagian: beberapa model mungkin masih mengenali.",
+                "weak": "Proteksi lemah: foto kemungkinan masih dikenali."}[v]
+        nums = [f"Kemiripan terburuk (semua model & kompresi): {cos:+.2f} (ambang cocok ≈ {MATCH_COS:.2f}).",
+                f"Tahan kompresi & resize: {'ya' if f['survives_jpeg_and_resize'] else 'tidak'}.",
+                f"Tampilan: {vis} (SSIM wajah {f['ssim_face']})."]
+        limits = ("Diuji pada beberapa model open-source dalam simulasi — bukan jaminan terhadap sistem komersial "
+                  "atau AI masa depan. Proteksi menghentikan pencocokan identitas, bukan deteksi wajah.")
+        tips = ["Coba kekuatan 'max' jika hasilnya partial/weak.", "Unggah foto yang sudah diproteksi, bukan aslinya."]
+        summ = head
+    else:
+        head = {"broken": "Identity matching is broken on every model we checked.",
+                "partial": "Partial protection: some models may still recognise the face.",
+                "weak": "Weak protection: the face is likely still recognisable."}[v]
+        nums = [f"Worst-case similarity (all models, all upload transforms): {cos:+.2f} (match threshold ≈ {MATCH_COS:.2f}).",
+                f"Survives compression and resizing: {'yes' if f['survives_jpeg_and_resize'] else 'no'}.",
+                f"Appearance: {vis} (face SSIM {f['ssim_face']})."]
+        limits = ("Checked on a few open-source models in simulation — not a guarantee against commercial systems "
+                  "or future AI. It stops identity matching, not face detection.")
+        tips = ["Try 'max' strength if the result is partial or weak.", "Post the protected file, never the original."]
+        summ = head
+    return {"headline": head, "summary": summ, "numbers": nums, "limits": limits, "tips": tips}
+
+
+def _flatten(s: dict) -> str:
+    return "\n".join([s["headline"], "", s["summary"], "", *[f"• {n}" for n in s["numbers"]], "", s["limits"], "",
+                      *[f"Tip: {t}" for t in s["tips"]]])
 
 
 @app.post("/report")
 def report(body: ReportRequest):
     lang = body.lang if body.lang in ("id", "en") else "id"
-    system = _REPORT_SYSTEM_ID if lang == "id" else _REPORT_SYSTEM_EN
-    user_prompt = _report_user_prompt(body.metrics, body.meta, lang)
+    facts = _facts(body)
+    user_text = "Verified protection results (JSON):\n" + json.dumps(facts, ensure_ascii=False)
+    try:
+        text, model, backend = _gemini_generate(_SYSTEM[lang], user_text, _REPORT_SCHEMA)
+        sections = json.loads(text)
+        for k in ("headline", "summary", "numbers", "limits", "tips"):
+            if k not in sections:
+                raise ValueError(f"missing {k}")
+        return {"report": _flatten(sections), "sections": sections, "lang": lang,
+                "source": "gemini", "model": model, "backend": backend}
+    except Exception as exc:  # noqa: BLE001
+        code = str(exc) if isinstance(exc, RuntimeError) else f"bad_output:{type(exc).__name__}"
+        sections = _template_report(body, lang)
+        return {"report": _flatten(sections), "sections": sections, "lang": lang,
+                "source": "template", "model": "none", "fallback_reason": code}
 
-    result = _gemini_report(system, user_prompt)
-    if result is not None:
-        text, model = result
-        return {"report": text, "lang": lang, "model": model}
 
-    # No key, or Gemini failed: serve the contract mock (demo-safe fallback).
-    mock = _REPORT_MOCK_ID if lang == "id" else _REPORT_MOCK_EN
-    resp = {"report": mock, "lang": lang, "model": "mock"}
-    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_GEMINI_API_KEY"):
-        resp["note"] = "gemini_unavailable_fallback"
-    return resp
+@app.get("/report/selftest")
+def report_selftest():
+    """Live Gemini round-trip. Run this BEFORE recording the demo: source must be 'gemini'."""
+    try:
+        text, model, backend = _gemini_generate("Reply with the single word: ok", "ping")
+        return {"ok": True, "source": "gemini", "model": model, "backend": backend, "reply": text[:40]}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=503, content={"ok": False, "source": "none", "reason": str(exc),
+                                                      "status": _gemini_status()})

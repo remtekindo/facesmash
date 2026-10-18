@@ -1,5 +1,11 @@
 # Face Cloak Service
 
+> **v0.2 (2026-10-18):** the engine is now `prototype/cloak_v2.py` (ensemble + DSSIM budget + EOT), metrics are
+> measured on the final photo, and `/report` reports honestly whether Gemini answered. The sections below describe
+> the original v0.1 flow where not superseded — see `../docs/api-contract.md` (v0.3 section) and
+> `../prototype/RESULTS_v2.md` for current behaviour and numbers.
+
+
 REST microservice wrapping the validated cloaking prototype (`../prototype/cloak.py`).
 It adds an adversarial "cloak" to a face photo so AI facial-recognition models
 fail to match the identity — while the photo still looks normal to humans.

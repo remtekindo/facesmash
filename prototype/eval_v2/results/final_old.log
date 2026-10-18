@@ -1,0 +1,9 @@
+user_selfie       old  ssim=0.894 psnr=33.4 |d|=4.85 worst-cos vgg=+0.59 casia=+0.68 arc=+0.75 glint=+0.76 mbf=+0.75
+user_portrait     old  ssim=0.908 psnr=33.3 |d|=4.90 worst-cos vgg=+0.57 casia=+0.67 arc=+0.74 glint=+0.74 mbf=+0.66
+astronaut         old  ssim=0.937 psnr=32.8 |d|=5.23 worst-cos vgg=+0.59 casia=+0.67 arc=+0.82 glint=+0.82 mbf=+0.75
+kate_siegel       old  ssim=0.890 psnr=33.2 |d|=4.95 worst-cos vgg=+0.45 casia=+0.43 arc=+0.62 glint=+0.67 mbf=+0.51
+angelina_jolie    old  ssim=0.935 psnr=33.5 |d|=4.77 worst-cos vgg=+0.07 casia=+0.30 arc=+0.58 glint=+0.65 mbf=+0.50
+bradley_cooper    old  ssim=0.945 psnr=33.0 |d|=5.12 worst-cos vgg=+0.63 casia=+0.51 arc=+0.75 glint=+0.77 mbf=+0.70
+paul_rudd         old  ssim=0.970 psnr=32.8 |d|=5.27 worst-cos vgg=+0.52 casia=+0.75 arc=+0.82 glint=+0.86 mbf=+0.80
+shea_whigham      old  ssim=0.951 psnr=32.6 |d|=5.38 worst-cos vgg=+0.56 casia=+0.60 arc=+0.76 glint=+0.76 mbf=+0.72
+MEAN[old] ssim=0.929 psnr=33.1 vgg=+0.50 casia=+0.58 arc=+0.73 glint=+0.75 mbf=+0.67
