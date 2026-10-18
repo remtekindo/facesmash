@@ -17,9 +17,12 @@ certifi==2026.7.22
 charset-normalizer==3.5.2
 idna==3.20
 tqdm==4.70.1
+onnx
+onnx2torch
 # --- web stack (not part of the validated prototype pins; resolved at build time) ---
 fastapi
 uvicorn
 python-multipart
 # --- persistence (rules-mandated Firebase/Firestore usage; see FIRESTORE_SETUP.md) ---
 google-cloud-firestore
+google-auth   # Vertex AI (Gemini) via the Cloud Run service account

@@ -1,0 +1,9 @@
+user_selfie       18.3s ssim=0.980 psnr=35.0 |d|=2.89 p99=17  worst-cos vgg=+0.11 casia=+0.20 arc=+0.35 glint=+0.39 mbf=+0.32
+user_portrait     19.6s ssim=0.979 psnr=33.6 |d|=3.70 p99=18  worst-cos vgg=+0.24 casia=+0.14 arc=+0.36 glint=+0.37 mbf=+0.14
+astronaut         17.3s ssim=0.984 psnr=34.6 |d|=3.12 p99=18  worst-cos vgg=+0.28 casia=+0.29 arc=+0.58 glint=+0.58 mbf=+0.53
+kate_siegel       20.5s ssim=0.985 psnr=35.8 |d|=2.72 p99=15  worst-cos vgg=+0.11 casia=+0.24 arc=+0.34 glint=+0.32 mbf=+0.18
+angelina_jolie    30.4s ssim=0.994 psnr=36.5 |d|=2.65 p99=12  worst-cos vgg=+0.21 casia=+0.21 arc=+0.28 glint=+0.35 mbf=+0.15
+bradley_cooper    26.8s ssim=0.990 psnr=33.6 |d|=3.76 p99=18  worst-cos vgg=+0.13 casia=+0.16 arc=+0.33 glint=+0.36 mbf=+0.22
+paul_rudd         23.9s ssim=0.994 psnr=32.8 |d|=4.11 p99=18  worst-cos vgg=+0.26 casia=+0.14 arc=+0.39 glint=+0.43 mbf=+0.24
+shea_whigham      23.5s ssim=0.990 psnr=33.3 |d|=3.88 p99=18  worst-cos vgg=+0.18 casia=+0.20 arc=+0.35 glint=+0.42 mbf=+0.15
+MEAN[f_low] ssim=0.987 psnr=34.4 t=22.5s  vgg=+0.19 casia=+0.20 arc=+0.37 glint=+0.40 mbf=+0.24

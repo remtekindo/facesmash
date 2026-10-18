@@ -144,3 +144,41 @@ Thin FastAPI wrapper around `prototype/cloak.py` → Docker (`python:3.12-slim`,
 ```
 
 **Setup note for the team:** enable Vertex AI API (or grab a key from AI Studio) on the competition's Google Cloud project; store as server env var. Model choice: any current `gemini-*` text model. If the key isn't ready, ship with the mock above — the UI contract is identical.
+
+---
+
+## v0.3 changes (engine v2, 2026-10-18) — additive, v0.1/v0.2 clients keep working
+
+**`POST /protect`** (same request; new optional field `max_faces`, default 3; `jpeg_simulate` is ignored —
+verification always runs). Response keeps `protected_image`, `metrics`, `meta` and adds `verification`.
+
+`metrics` semantics changed (field names kept for compatibility) — **measured on the final photo, worst case over
+all checked models and upload transforms (PNG, JPEG-75, 50% downscale + JPEG-75)**:
+
+| field | meaning now |
+|---|---|
+| `embedding_distance` | L2 distance = sqrt(2 − 2·worst_cos). Match threshold ≈ **1.18** (cos 0.30), was "~1.0" |
+| `cosine_similarity` | worst-case cosine to the original (≤ 0.30 = no match) |
+| `jpeg_q75_survived` / `jpeg_q75_distance` | worst case over the two lossy transforms (JPEG-75, downscale+JPEG-75) |
+| `psnr_db` | **face region** PSNR (was whole image); `psnr_full_db` = whole image |
+| `ssim_face`, `visibility` | new: face SSIM and `near-invisible` / `subtle` / `visible on close look` / `visible` |
+
+`verification` (new):
+```json
+{ "verdict": "broken | partial | weak", "identity_match_broken": true, "match_threshold_cos": 0.3,
+  "models": { "vggface2": {"worst_cos": -0.06, "role": "optimised against"},
+              "arcface":  {"worst_cos": 0.16,  "role": "independent check (not optimised against)"} },
+  "transforms": ["png", "jpeg75", "down50_jpeg75"] }
+```
+`meta` adds `faces_protected`, `independent_check`; `surrogate_model` now lists the attacked ensemble.
+
+**`POST /report`** — request may include `verification`; `lang` default stays `id` (the web app sends `en`).
+Response: `{ report, sections:{headline,summary,numbers[],limits,tips[]}, lang, source, model, backend }`.
+`source` is `"gemini"` or `"template"`; on `template` there is also `fallback_reason`
+(`no_credentials`, `http_403`, `bad_output:…`, …). The old silent `mock` is gone.
+Backends: Gemini API key (`GEMINI_API_KEY`) or Vertex AI through the Cloud Run service account
+(`VERTEX_LOCATION`, default `us-central1`; grant the service account `roles/aiplatform.user`).
+`GEMINI_MODEL` overrides the model; fallbacks: `gemini-2.5-flash`, `gemini-flash-latest`.
+
+**`GET /report/selftest`** — live Gemini round-trip; 200 `{"ok":true,"source":"gemini",…}` or 503 with the reason.
+`GET /health` now lists `ensemble`, `holdout` and `gemini` status.
