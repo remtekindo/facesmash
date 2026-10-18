@@ -50,8 +50,10 @@ NOT verified:
   must return `source: "gemini"`. Vertex needs `roles/aiplatform.user` on the Cloud Run service account.
   Default model is `gemini-2.5-flash` (fallback `gemini-flash-latest`); check the current model list.
 - The **Docker build** (ONNX download step, image size, cold start) and Cloud Run latency (expect ~30–45 s standard
-  on 2 vCPU for one face; 3 faces ≈ 3×).
-- Multi-face photos (code path exists: up to 3 faces; not tested on a real group photo).
+  on 2 vCPU for one face; time scales per face).
+- Real group photos. A synthetic 3-face composite (2698×900) at `max` took 186 s on 2 CPU threads, peak RSS 1.7 GB,
+  3/3 faces protected (verdict broken, face SSIM 0.9745). Default is therefore `MAX_FACES=2` to stay well below
+  the 300 s Cloud Run timeout; raise it only if you measure Cloud Run speed.
 - Firestore writes with the new `metrics`/`verification` payload (schema is a superset of v1).
 - Any commercial recogniser.
 

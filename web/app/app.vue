@@ -150,7 +150,7 @@
     <section id="how" class="how">
       <h2>How it works</h2>
       <div class="how-grid">
-        <div class="card"><div class="how-n">01</div><h3>Detect</h3><p>MTCNN finds up to 3 faces and their landmarks. Each face gets its own cloak.</p></div>
+        <div class="card"><div class="how-n">01</div><h3>Detect</h3><p>MTCNN finds up to 2 faces and their landmarks. Each face gets its own cloak.</p></div>
         <div class="card"><div class="how-n">02</div><h3>Perturb</h3><p>Gradient optimisation against an ensemble of 3 face-recognition models pushes your embedding away from your identity, while a perceptual (DSSIM) budget keeps the change hidden.</p></div>
         <div class="card"><div class="how-n">03</div><h3>Verify</h3><p>We re-detect the face in the final photo and re-measure it on every model, after JPEG and downscaling. The verdict uses the worst case.</p></div>
       </div>

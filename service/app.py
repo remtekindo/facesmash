@@ -43,7 +43,7 @@ VERSION = "0.2"
 ENGINE_NAME = f"cloak-v2 {VERSION} (ensemble PGD + DSSIM budget + EOT)"
 MAX_BYTES = 10 * 1024 * 1024          # 10 MB
 MAX_DIM = 2048                        # downscale if larger
-MAX_FACES = int(os.environ.get("MAX_FACES", "3"))
+MAX_FACES = int(os.environ.get("MAX_FACES", "2"))
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 # cos(original, protected) at/below which a recogniser no longer matches the identity.
 MATCH_COS = C.MATCH_COS_THRESHOLD

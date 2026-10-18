@@ -149,7 +149,7 @@ Thin FastAPI wrapper around `prototype/cloak.py` → Docker (`python:3.12-slim`,
 
 ## v0.3 changes (engine v2, 2026-10-18) — additive, v0.1/v0.2 clients keep working
 
-**`POST /protect`** (same request; new optional field `max_faces`, default 3; `jpeg_simulate` is ignored —
+**`POST /protect`** (same request; new optional field `max_faces`, default 2 (env `MAX_FACES`; time scales linearly per face); `jpeg_simulate` is ignored —
 verification always runs). Response keeps `protected_image`, `metrics`, `meta` and adds `verification`.
 
 `metrics` semantics changed (field names kept for compatibility) — **measured on the final photo, worst case over

@@ -12,7 +12,7 @@ Cloaking method based on LowKey (Cherepanova et al., ICLR 2021) with ensemble/EO
 1. **Cloaking engine v2** (`service/`, `prototype/cloak_v2.py`) — FastAPI microservice. Optimises a
    perturbation against an **ensemble of 3 face-recognition models** (VGGFace2, CASIA-WebFace, MobileFaceNet)
    with a margin loss, **EOT** (crop jitter, resampling, real JPEG) and a **DSSIM perceptual budget** so the
-   noise hides where it is cheapest. Up to 3 faces per photo.
+   noise hides where it is cheapest. Up to 2 faces per photo by default (`MAX_FACES`).
 2. **Verification on the final photo** — the output is re-detected and re-embedded under PNG / JPEG-75 /
    downscale+JPEG-75, on all ensemble models **plus ArcFace-R50 as an independent hold-out**. The verdict
    (`broken` / `partial` / `weak`) uses the **worst case**.
