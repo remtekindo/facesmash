@@ -161,8 +161,21 @@ async def protect(
     cloaked_crop, _dists, _pgd_s = cloak_face(
         face_tensor, embed_fn, steps=STRENGTH_STEPS[strength], seed=run_seed, verbose=False)
 
+    # Delta-upscale fix (2026-10-18): the old code pasted the 160x160 cloaked
+    # crop resized back up, destroying original detail via the downscale-upscale
+    # cycle (this was the main source of visible degradation, not just PGD).
+    # Now: upscale ONLY the perturbation delta and add it to the ORIGINAL
+    # high-res face, preserving all native detail.
+    box_w, box_h = box[2] - box[0], box[3] - box[1]
+    with torch.no_grad():
+        delta_160 = cloaked_crop - face_tensor  # in [-eps, eps]
+        delta_up = torch.nn.functional.interpolate(
+            delta_160.unsqueeze(0), size=(box_h, box_w),
+            mode="bilinear", align_corners=False).squeeze(0)
+        face_native = pil_to_tensor(img.crop(box))  # original, full res
+        cloaked_native = (face_native + delta_up).clamp(0, 1)
     out = img.copy()
-    out.paste(tensor_to_pil(cloaked_crop).resize((box[2] - box[0], box[3] - box[1]), Image.BILINEAR), box)
+    out.paste(tensor_to_pil(cloaked_native), box)
 
     with torch.no_grad():
         e0 = embed_fn(face_tensor)
