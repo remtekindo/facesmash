@@ -12,10 +12,10 @@ Pipeline:
      model pretrained on VGGFace2, inside a small L_inf ball (default 8/255)
      so the change stays visually subtle. Perturbation is restricted to the
      detected face region only.
-  3. Social-media robustness: every N PGD steps the adversarial crop is
-     round-tripped through real JPEG compression (quality 75). This is a
-     non-differentiable approximation of LowKey's differentiable-JPEG training
-     (a simpler EOT-lite); documented honestly in RESULTS.md.
+  3. Social-media robustness is VERIFIED (not trained): the final cloaked
+     output is round-tripped through real JPEG Q75 and the embedding distance
+     re-measured honestly. (In-loop JPEG EOT was removed 2026-10-18: it baked
+     visible block artifacts into the perturbation at 160x160.)
 
 Usage:
   python cloak.py --input face.png --output cloaked.png --steps 60
@@ -94,7 +94,7 @@ def cloak_face(
     eps=8 / 255,
     steps=60,
     alpha=None,
-    jpeg_every=5,
+    jpeg_every=0,
     jpeg_quality=75,
     seed=None,
     verbose=True,
@@ -105,6 +105,15 @@ def cloak_face(
     x == x0 the gradient of ||emb(x) - emb(x0)|| is exactly zero, so a
     zero start never moves. The randomness also means every run produces a
     different perturbation pattern — a feature, not a bug, for this product.
+
+    jpeg_every: if > 0, round-trip through real JPEG every N steps (EOT-lite
+    for social-media robustness). DEFAULT 0 (disabled): in-loop JPEG at the
+    160x160 working resolution bakes visible 8x8 block artifacts into the
+    perturbation, which become glaringly obvious when the cloaked crop is
+    upscaled back to the face-box size. The /protect endpoint still VERIFIES
+    JPEG-Q75 survival on the final output (honest reporting); it just no
+    longer destroys visual quality during optimization. (Fixed 2026-10-18
+    after user report of visibly degraded output.)
 
     Returns (cloaked_tensor, distances_over_time, elapsed_seconds).
     """
@@ -153,7 +162,7 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--eps", type=float, default=8 / 255)
     ap.add_argument("--steps", type=int, default=60)
-    ap.add_argument("--jpeg-every", type=int, default=5)
+    ap.add_argument("--jpeg-every", type=int, default=0)
     ap.add_argument("--jpeg-quality", type=int, default=75)
     ap.add_argument("--margin", type=float, default=0.25)
     args = ap.parse_args()
