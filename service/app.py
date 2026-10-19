@@ -35,13 +35,16 @@ from pydantic import BaseModel, Field
 from firestore_store import save_protection_job
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
-import cloak_v2 as C  # noqa: E402
+VERSION = "0.2"
+if os.environ.get("CLOAK_MODE") == "advanced":
+    import cloak_advanced as C  # noqa: E402
+    ENGINE_NAME = f"cloak-advanced {VERSION} (MI-FGSM + adaptive mask + EOT)"
+else:
+    import cloak_v2 as C  # noqa: E402
+    ENGINE_NAME = f"cloak-v2 {VERSION} (ensemble PGD + DSSIM budget + EOT)"
 
 log = logging.getLogger("face-cloak")
 
-VERSION = "0.2"
-ENGINE_NAME = f"cloak-v2 {VERSION} (ensemble PGD + DSSIM budget + EOT)"
-MAX_BYTES = 10 * 1024 * 1024          # 10 MB
 MAX_DIM = 2048                        # downscale if larger
 MAX_FACES = int(os.environ.get("MAX_FACES", "2"))
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}

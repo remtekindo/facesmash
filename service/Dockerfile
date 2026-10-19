@@ -29,6 +29,7 @@ ENV FACESMASH_MBF_ONNX=/app/models/w600k_mbf.onnx \
 
 # 3. Code: prototype/cloak_v2.py is the engine (cloak.py = legacy v1, kept in the repo only).
 COPY prototype/cloak_v2.py ./prototype/cloak_v2.py
+COPY prototype/cloak_advanced.py ./prototype/cloak_advanced.py
 COPY service/app.py ./service/app.py
 COPY service/firestore_store.py ./service/firestore_store.py
 
