@@ -332,7 +332,7 @@ def cloak_face(x_native: torch.Tensor, job: FaceJob, ens: Ensemble, cfg: Cfg, ve
             if rng.random() < 0.7:
                 # Mild blur to simulate sharpening artifacts after social media compression
                 if rng.random() < 0.5:
-                    kernel = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 16.0
+                    kernel = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3).repeat(3, 1, 1, 1) / 16.0
                     x = x.unsqueeze(0)
                     x = F.conv2d(x, kernel, padding=1, groups=3).squeeze(0)
                 # Real JPEG, straight-through with lower bound (40) for aggressive compression simulation
