@@ -1,5 +1,6 @@
 """
 cloak_v2.py — perceptually-constrained, ensemble, margin-based facial cloaking.
+v2.1 (Qwen Update): Enhanced EOT for social media resilience + spatial jitter for detector shift.
 
 Why v2 exists (measured, see prototype/RESULTS_v2.md):
   v1 (cloak.py) maximised the embedding distance of ONE model on a 160x160 crop,
@@ -20,7 +21,7 @@ What changed:
      as green irises were the most noticeable artefact in testing).
   4. EOT: random crop/landmark jitter, down-up resampling and straight-through
      real JPEG inside the loop, so protection survives re-detection, resize and
-     compression (not only a perfect re-crop).
+     compression (not only a perfect re-crop). [v2.1: Added mild blur + harsher JPEG 40-91]
   5. HONEST VERIFICATION on the FINAL composited image: re-detect, re-embed, under
      PNG / JPEG-75 / down-50%+JPEG-75; report the WORST case.
 
@@ -53,7 +54,6 @@ ARC_TPL = np.array(
 # (ArcFace-style verification thresholds sit around 0.25-0.35; impostor mean ~0.)
 MATCH_COS_THRESHOLD = 0.30
 
-
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -73,7 +73,6 @@ class Cfg:
     models_per_step: int = 0      # 0 = all models every step; k = random subset
     seed: int | None = None
 
-
 # strength -> (eps/255, steps, target_cos, ssim_w). Calibrated on 8 test faces
 # (prototype/RESULTS_v2.md); "max" trades visibility for protection.
 STRENGTH = {
@@ -82,14 +81,12 @@ STRENGTH = {
     "max":      (28.0, 150, -0.20, 5.0),
 }
 
-
 def cfg_for(strength: str, **kw) -> Cfg:
     eps, steps, tgt, ssim_w = STRENGTH[strength]
     c = Cfg(eps=eps / 255, steps=steps, target_cos=tgt, ssim_w=ssim_w)
     for k, v in kw.items():
         setattr(c, k, v)
     return c
-
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -138,7 +135,6 @@ class Ensemble:
             return F.normalize(net((view * 255.0 - 127.5) / 128.0), dim=1)
         return F.normalize(net((view - 0.5) / 0.5), dim=1)
 
-
 # --------------------------------------------------------------------------- #
 # Geometry helpers (all differentiable w.r.t. the image, not the geometry)
 # --------------------------------------------------------------------------- #
@@ -157,13 +153,11 @@ def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     t = dm - scale * R @ sm
     return np.concatenate([scale * R, t[:, None]], axis=1).astype(np.float32)
 
-
 def facenet_view(x, box, margin, out=160):
     w, h = box[2] - box[0], box[3] - box[1]
     m = margin * max(w, h)
     b = torch.tensor([[0.0, box[0] - m, box[1] - m, box[2] + m, box[3] + m]], dtype=x.dtype)
     return roi_align(x[None], b, (out, out), spatial_scale=1.0, sampling_ratio=2, aligned=True)
-
 
 def arc_view(x_aa, pts, out=112):
     """Aligned 112x112 crop via differentiable grid_sample (pixel-centre coords)."""
@@ -179,7 +173,6 @@ def arc_view(x_aa, pts, out=112):
     grid = torch.stack([gx, gy], dim=-1).reshape(1, out, out, 2)
     return F.grid_sample(x_aa[None], grid, mode="bilinear", padding_mode="border", align_corners=True)
 
-
 def _jitter_pts(pts, rng, w):
     c = pts.mean(0)
     s = 1.0 + rng.normal(0, 0.05)
@@ -187,7 +180,6 @@ def _jitter_pts(pts, rng, w):
     R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]], dtype=np.float32)
     t = rng.normal(0, 0.03 * w, size=2).astype(np.float32)
     return ((pts - c) * s) @ R.T + c + t
-
 
 def jpeg_ste(x: torch.Tensor, quality: int) -> torch.Tensor:
     """Forward = real JPEG, backward = identity (straight-through)."""
@@ -197,7 +189,6 @@ def jpeg_ste(x: torch.Tensor, quality: int) -> torch.Tensor:
     buf.seek(0)
     y = torch.from_numpy(np.asarray(Image.open(buf).convert("RGB")).astype(np.float32) / 255.0).permute(2, 0, 1)
     return x + (y - x).detach()
-
 
 def _gauss_blur(t, sigma):
     if sigma <= 0:
@@ -209,7 +200,6 @@ def _gauss_blur(t, sigma):
     t = F.conv2d(F.pad(t, (k // 2, k // 2, 0, 0), mode="replicate"), g.view(1, 1, 1, k).repeat(c, 1, 1, 1), groups=c)
     t = F.conv2d(F.pad(t, (0, 0, k // 2, k // 2), mode="replicate"), g.view(1, 1, k, 1).repeat(c, 1, 1, 1), groups=c)
     return t
-
 
 # --------------------------------------------------------------------------- #
 # Perceptual budget map
@@ -224,7 +214,6 @@ def face_mask(x0: torch.Tensor, box, cfg: Cfg) -> torch.Tensor:
     t = ((1.0 - r) / 0.35).clamp(0, 1)            # 1 inside r<=0.65, 0 at r>=1
     return (t * t * (3 - 2 * t))[None]
 
-
 def _ssim_map(a, b, win=7, sigma=1.5):
     """Differentiable SSIM map, (3,H,W) inputs in [0,1] -> (H,W) mean over channels."""
     ax = torch.arange(win, dtype=a.dtype) - win // 2
@@ -237,13 +226,11 @@ def _ssim_map(a, b, win=7, sigma=1.5):
     m = ((2 * mu_a * mu_b + C1) * (2 * cab + C2)) / ((mu_a ** 2 + mu_b ** 2 + C1) * (va + vb + C2))
     return m.mean(0)
 
-
 def _to_rgb_delta(raw: torch.Tensor, chroma: float) -> torch.Tensor:
     """raw (3,H,W) in [-1,1] = (Y, Cb, Cr) -> RGB offsets in ~[-1,1]."""
     Y, Cb, Cr = raw[0], raw[1] * chroma, raw[2] * chroma
     d = torch.stack([Y + 1.402 * Cr, Y - 0.344 * Cb - 0.714 * Cr, Y + 1.772 * Cb])
     return d.clamp(-1, 1)
-
 
 # --------------------------------------------------------------------------- #
 # Core optimisation for ONE face
@@ -254,14 +241,12 @@ class FaceJob:
     pts: np.ndarray       # (5,2) landmarks, native coords
     prob: float = 1.0
 
-
 @dataclass
 class FaceResult:
     box: tuple
     steps: int
     seconds: float
     final_loss_cos: dict = field(default_factory=dict)
-
 
 def _views(ens: Ensemble, x, box, pts, rng, jitter: bool, idx=None):
     """One embedding view per model (dict idx->tensor) for image tensor x (3,H,W)."""
@@ -290,7 +275,6 @@ def _views(ens: Ensemble, x, box, pts, rng, jitter: bool, idx=None):
             pj = _jitter_pts(p, rng, w * sa) if jitter else p
             outs[i] = arc_view(xa, pj)
     return outs
-
 
 def cloak_face(x_native: torch.Tensor, job: FaceJob, ens: Ensemble, cfg: Cfg, verbose=False):
     """Return (delta_native (3,h,w) over the face REGION, region_xyxy, FaceResult)."""
@@ -338,12 +322,22 @@ def cloak_face(x_native: torch.Tensor, job: FaceJob, ens: Ensemble, cfg: Cfg, ve
         delta = _to_rgb_delta(torch.tanh(p), cfg.chroma) * (cfg.eps * mask)
         x = (x0 + delta).clamp(0, 1)
         if cfg.eot:
-            if rng.random() < 0.5:                       # resolution loss
+            # 1. Resolution loss (down-up sampling) - increased probability
+            if rng.random() < 0.6:
                 r = float(rng.uniform(cfg.eot_min_scale, 0.95))
                 small = F.interpolate(x[None], scale_factor=r, mode="bilinear", antialias=True, recompute_scale_factor=False)
                 x = F.interpolate(small, size=(wh, ww), mode="bilinear", align_corners=False)[0]
-            if rng.random() < 0.4:                       # real JPEG, straight-through
-                x = jpeg_ste(x, int(rng.integers(50, 91)))
+            
+            # 2. Social Media Compression Simulation (Harsher JPEG + Mild Blur)
+            if rng.random() < 0.7:
+                # Mild blur to simulate sharpening artifacts after social media compression
+                if rng.random() < 0.5:
+                    kernel = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 16.0
+                    x = x.unsqueeze(0)
+                    x = F.conv2d(x, kernel, padding=1, groups=3).squeeze(0)
+                # Real JPEG, straight-through with lower bound (40) for aggressive compression simulation
+                x = jpeg_ste(x, int(rng.integers(40, 91)))
+                
         idx = list(train)
         if cfg.models_per_step and cfg.models_per_step < len(train):
             idx = sorted(rng.choice(train, cfg.models_per_step, replace=False).tolist())
@@ -372,17 +366,14 @@ def cloak_face(x_native: torch.Tensor, job: FaceJob, ens: Ensemble, cfg: Cfg, ve
             delta_n = delta
     return delta_n, (rx1, ry1, rx2, ry2), FaceResult(job.box, cfg.steps, time.time() - t0, last_cos)
 
-
 # --------------------------------------------------------------------------- #
 # Image-level API
 # --------------------------------------------------------------------------- #
 def pil_to_t(img):
     return torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
 
-
 def t_to_pil(t):
     return Image.fromarray((t.detach().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8))
-
 
 def detect_faces(mtcnn, img, max_faces=3, min_prob=0.9) -> list[FaceJob]:
     boxes, probs, pts = mtcnn.detect(img, landmarks=True)
@@ -392,7 +383,6 @@ def detect_faces(mtcnn, img, max_faces=3, min_prob=0.9) -> list[FaceJob]:
             for b, pr, p in zip(boxes, probs, pts) if pr is not None and pr >= min_prob]
     jobs.sort(key=lambda j: -(j.box[2] - j.box[0]) * (j.box[3] - j.box[1]))
     return jobs[:max_faces]
-
 
 def cloak_image(img: Image.Image, jobs: list[FaceJob], ens: Ensemble, cfg: Cfg, verbose=False):
     """Cloak every job in-place on a float copy. Returns (PIL out, [FaceResult])."""
@@ -405,7 +395,6 @@ def cloak_image(img: Image.Image, jobs: list[FaceJob], ens: Ensemble, cfg: Cfg, 
         results.append(fr)
     return t_to_pil(x), results
 
-
 # --------------------------------------------------------------------------- #
 # Honest verification on the FINAL image
 # --------------------------------------------------------------------------- #
@@ -413,20 +402,17 @@ def _jpeg(img, q):
     b = io.BytesIO(); img.save(b, "JPEG", quality=q); b.seek(0)
     return Image.open(b).convert("RGB")
 
-
 UPLOAD_TRANSFORMS = {
     "png": lambda im: im,
     "jpeg75": lambda im: _jpeg(im, 75),
     "down50_jpeg75": lambda im: _jpeg(im.resize((max(8, im.width // 2), max(8, im.height // 2)), Image.LANCZOS), 75),
 }
 
-
 @torch.no_grad()
 def reference_embeddings(img, mtcnn, ens, jobs):
     xt = pil_to_t(img)
     return [{i: ens.embed(i, v) for i, v in _views(ens, xt, j.box, j.pts, np.random.default_rng(0), jitter=False).items()}
             for j in jobs]
-
 
 @torch.no_grad()
 def verify(orig, out, mtcnn, ens, jobs, refs=None):
